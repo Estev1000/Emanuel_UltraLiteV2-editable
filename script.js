@@ -3,6 +3,7 @@ const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecogni
 let recognition = null;
 let isRecording = false;
 let recordingTimeout = null;
+let accumulatedText = ''; // Texto acumulado entre reinicios por pausa
 
 // Respuestas por defecto
 const DEFAULT_RESPONSES = ['Bienvenido', 'Entiendo', 'Un momento', '¿Cómo estás?', 'Gracias', 'De nada'];
@@ -15,7 +16,7 @@ let responseTranslations = JSON.parse(localStorage.getItem('responseTranslations
 
 if (SpeechRecognition) {
     recognition = new SpeechRecognition();
-    recognition.continuous = false;
+    recognition.continuous = true;
     recognition.interimResults = false;
 } else {
     alert("Este navegador no soporta reconocimiento de voz. Use Chrome o Safari.");
@@ -48,69 +49,86 @@ function resetBtn() {
     }
 }
 
-// --- ESCUCHAR CLIENTE ---
+// --- ESCUCHAR CLIENTE (Push-to-Talk) ---
 
-btnListen.addEventListener('click', () => {
-    if (!recognition) return;
+function startListening() {
+    if (!recognition || isRecording) return;
     
-    // Si ya está grabando, detener
-    if (isRecording) {
-        try {
-            recognition.stop();
-            resetBtn();
-        } catch (e) {
-            console.error(e);
-            resetBtn();
-        }
-        return;
-    }
+    accumulatedText = ''; // Limpiar texto acumulado al iniciar sesión nueva
     
-    // Iniciar grabación directamente
     try {
         isRecording = true;
         recognition.lang = clientLang.value;
         recognition.start();
         btnListen.classList.add('recording');
-        clientOutput.innerHTML = '<p class="placeholder">Escuchando... Hable ahora.</p>';
+        clientOutput.innerHTML = '<p class="placeholder">Te escucho... Suelta para terminar.</p>';
         
-        // Timeout de seguridad: máximo 15 segundos
+        // Timeout de seguridad: máximo 60 segundos
         recordingTimeout = setTimeout(() => {
             if (isRecording) {
-                try {
-                    recognition.stop();
-                } catch (e) {
-                    console.error(e);
-                }
-                resetBtn();
+                stopListening();
             }
-        }, 15000);
+        }, 60000);
     } catch (e) {
         console.error(e);
         clientOutput.innerHTML = '<p style="color:red">❌ Error al iniciar grabación: ' + e.message + '</p>';
         resetBtn();
     }
-});
+}
+
+function stopListening() {
+    if (!isRecording) return;
+    resetBtn(); // Marcar como no-grabando ANTES de llamar stop()
+    try {
+        recognition.stop(); // El onend detectará isRecording=false y traducirá
+    } catch (e) {
+        console.error(e);
+        finalizeListening(); // En caso de error, traducir igual
+    }
+}
+
+// Eventos para PC
+btnListen.addEventListener('mousedown', startListening);
+btnListen.addEventListener('mouseup', stopListening);
+btnListen.addEventListener('mouseleave', stopListening);
+
+// Eventos para Móviles
+btnListen.addEventListener('touchstart', (e) => {
+    e.preventDefault(); // Evitar comportamientos extraños en móviles
+    startListening();
+}, { passive: false });
+
+btnListen.addEventListener('touchend', (e) => {
+    e.preventDefault();
+    stopListening();
+}, { passive: false });
 
 if (recognition) {
-    recognition.onresult = async (event) => {
-        const text = event.results[0][0].transcript;
-        clientOutput.innerHTML = `<p><strong>Cliente:</strong> ${text}</p>`;
-        
-        // Traducir a Español
-        try {
-            clientOutput.innerHTML += '<p class="hint">Traduciendo...</p>';
-            const target = 'es';
-            const source = clientLang.value.split('-')[0];
-            const translated = await simpleTranslate(text, source, target);
-            clientOutput.innerHTML = `<p><strong>Cliente:</strong> ${text}</p><p style="color:#10b981"><strong>Trad:</strong> ${translated}</p>`;
-        } catch (err) {
-            clientOutput.innerHTML += '<p style="color:red">❌ Error al traducir.</p>';
+    recognition.onresult = (event) => {
+        // Tomar solo los nuevos resultados de esta sesión
+        let newText = '';
+        for (let i = event.resultIndex; i < event.results.length; i++) {
+            if (event.results[i].isFinal) {
+                newText += event.results[i][0].transcript + ' ';
+            }
         }
         
-        resetBtn();
+        if (newText.trim()) {
+            accumulatedText += newText;
+        }
+        
+        const displayText = accumulatedText.trim();
+        if (displayText) {
+            clientOutput.innerHTML = `<p><strong>Mi voz:</strong> ${displayText}</p><p class="hint">🎤 Seguimos escuchando...</p>`;
+        }
     };
 
     recognition.onerror = (event) => {
+        // 'no-speech' es normal durante pausas, NO mostrar error ni detener
+        if (event.error === 'no-speech') {
+            return; // Ignorar silencio — el onend se encargará de reiniciar
+        }
+        
         let msg = "Error: " + event.error;
         
         if (event.error === 'not-allowed') {
@@ -121,9 +139,6 @@ if (recognition) {
         if (event.error === 'network') {
             msg = "🔴 Error de red. Verifica tu conexión a Internet.";
         }
-        if (event.error === 'no-speech') {
-            msg = "🔇 No se escuchó nada. Intenta nuevamente más fuerte.";
-        }
         if (event.error === 'bad-grammar') {
             msg = "⚠️ No entendí bien. Habla más claro, por favor.";
         }
@@ -133,8 +148,41 @@ if (recognition) {
     };
 
     recognition.onend = () => {
-        resetBtn();
+        // Si el usuario sigue presionando el botón, reiniciar automáticamente
+        if (isRecording) {
+            try {
+                recognition.start(); // Reiniciar sin perder el texto acumulado
+            } catch (e) {
+                console.warn('No se pudo reiniciar el reconocimiento:', e);
+                finalizeListening();
+            }
+        } else {
+            // El usuario soltó el botón: traducir todo el texto acumulado
+            finalizeListening();
+        }
     };
+}
+
+// Traduce el texto acumulado al finalizar la escucha
+async function finalizeListening() {
+    const text = accumulatedText.trim();
+    if (!text) {
+        clientOutput.innerHTML = '<p class="hint">Toque abajo para escuchar...</p>';
+        return;
+    }
+    
+    clientOutput.innerHTML = `<p><strong>Mi voz:</strong> ${text}</p><p class="hint">Traduciendo...</p>`;
+    
+    try {
+        const target = 'es';
+        const source = clientLang.value.split('-')[0];
+        const translated = await simpleTranslate(text, source, target);
+        clientOutput.innerHTML = `<p><strong>Cliente:</strong> ${text}</p><p style="color:#10b981"><strong>Trad:</strong> ${translated}</p>`;
+    } catch (err) {
+        clientOutput.innerHTML = `<p><strong>Mi voz:</strong> ${text}</p><p style="color:red">❌ Error al traducir.</p>`;
+    }
+    
+    accumulatedText = '';
 }
 
 // --- RESPUESTA DEL STAFF ---
